@@ -3,24 +3,25 @@ Aplikasi Kiblat Selari Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan
 - Carian Lokasi Geocoding OpenStreetMap
 - Peta Folium (FOV 100m, Garis 2 km, Fixed Zoom)
 - Analisis Suria Tetap 5 Hari (falakpy)
-- Penjana PDF Bersijil & Muat Turun Kod QR
+- Penjana PDF Bersijil & Muat Turun Kod QR (Hos Terus di Render - 0% Iklan)
+- Auto-Padam Fail PDF Melebihi 60 Minit
 - Sistem Keep-Alive Automatik (Ping setiap 10 minit)
 - Countdown Timer 30 Saat Berfungsi Sepenuhnya (Live Countdown)
 - Panduan Penggunaan Bernombor Lengkap & Mesra Pengguna
-
-Pasang : pip install gradio folium falakpy pandas reportlab qrcode[pil] requests Pillow
-Jalan  : python kiblat_search_5days.py
 """
 
 import base64
 from datetime import datetime, date
 import math
 import os
+import shutil
 import tempfile
 import threading
 import time
 import traceback
 from falakpy import qibla
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
 import folium
 import gradio as gr
 import pandas as pd
@@ -38,19 +39,38 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+import uvicorn
 
 KAABAH_LAT, KAABAH_LON = 21.422487, 39.826206
 FIXED_DAYS = 5
 LOGO_FILE = "logo.png"
 
+# Folder simpanan fail PDF di dalam pelayan Render
+PDF_STORAGE_DIR = "pdf_reports"
+os.makedirs(PDF_STORAGE_DIR, exist_ok=True)
+
 
 # ----------------------------------------------------------------------
-# 0. Pemantau Percuma (Keep-Alive Self-Ping Setiap 10 Minit)
+# 0. Pemantau Percuma (Keep-Alive) & Pembersihan PDF (60 Minit)
 # ----------------------------------------------------------------------
+def cleanup_old_pdfs(max_age_seconds=3600):
+    """Memadam fail PDF yang berusia lebih dari 60 minit secara automatik."""
+    now = time.time()
+    if os.path.exists(PDF_STORAGE_DIR):
+        for fname in os.listdir(PDF_STORAGE_DIR):
+            if fname.endswith(".pdf"):
+                fpath = os.path.join(PDF_STORAGE_DIR, fname)
+                try:
+                    if now - os.path.getmtime(fpath) > max_age_seconds:
+                        os.remove(fpath)
+                except Exception:
+                    pass
+
+
 def start_keep_alive_monitor(interval_seconds=600):
     """Bebenang latar yang memanggil URL pelayan setiap 10 minit untuk mengelakkan mod tidur."""
     def ping_worker():
-        time.sleep(25)  # Tunggu pelayan mula beroperasi sepenuhnya
+        time.sleep(25)
         while True:
             try:
                 target_url = os.environ.get("RENDER_EXTERNAL_URL") or "http://127.0.0.1:7860"
@@ -233,7 +253,6 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements = []
 
-    # 1. Header Laporan dengan Logo Balai Cerap Negeri Sembilan
     if os.path.exists(LOGO_FILE):
         try:
             logo_img = RLImage(LOGO_FILE, width=54, height=54)
@@ -272,7 +291,6 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements.append(Spacer(1, 8))
 
-    # 2. Gambarajah Kompas Kiblat
     tmp_compass = os.path.join(tempfile.gettempdir(), f"cmp_{os.getpid()}.png")
     save_compass_image(bearing, tmp_compass)
     compass_img = RLImage(tmp_compass, width=95, height=95)
@@ -280,7 +298,6 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     elements.append(compass_img)
     elements.append(Spacer(1, 10))
 
-    # 3. Parameter Analisis
     lokasi_str = place_name.strip() if place_name and place_name.strip() else f"{lat:.6f}, {lon:.6f}"
 
     meta_data = [
@@ -325,7 +342,6 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements.append(Spacer(1, 6))
 
-    # 4. Jadual Analisis Suria
     if not df.empty:
         cols = list(df.columns)
         rows = [
@@ -388,16 +404,6 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
             pass
 
 
-def upload_pdf(pdf_path):
-    url = "https://tmpfiles.org/api/v1/upload"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    with open(pdf_path, "rb") as f:
-        res = requests.post(url, files={"file": f}, headers=headers, timeout=20)
-    res.raise_for_status()
-    raw_url = res.json()["data"]["url"]
-    return raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-
-
 def generate_qr(target_url):
     qr = qrcode.QRCode(
         version=1,
@@ -411,7 +417,7 @@ def generate_qr(target_url):
 
 
 # ----------------------------------------------------------------------
-# 4. Aliran Pemprosesan Utama
+# 4. Aliran Pemprosesan Utama (Hos Sendiri di Render)
 # ----------------------------------------------------------------------
 def process_data(lat, lon, start_date_str, tz, place_name=""):
     if lat is None or lon is None:
@@ -425,6 +431,8 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
         )
 
     try:
+        cleanup_old_pdfs(max_age_seconds=3600)
+
         bearing = qibla_bearing(lat, lon)
         map_html = make_folium_map(lat, lon, bearing)
 
@@ -509,14 +517,18 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             ]
             df = df[urutan]
 
-        # 2. Bina Dokumen PDF
-        pdf_path = os.path.join(
-            tempfile.gettempdir(), f"Laporan_Kiblat_{dt.strftime('%Y%m%d')}.pdf"
-        )
-        create_pdf(lat, lon, bearing, df, start_date_str, place_name, pdf_path)
+        # 2. Bina Dokumen PDF & Simpan Terus di Pelayan Render
+        time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_filename = f"Laporan_Kiblat_{time_tag}.pdf"
+        pdf_path = os.path.join(PDF_STORAGE_DIR, pdf_filename)
+        latest_pdf_path = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
 
-        # 3. Muat Naik & QR
-        direct_pdf_url = upload_pdf(pdf_path)
+        create_pdf(lat, lon, bearing, df, start_date_str, place_name, pdf_path)
+        shutil.copyfile(pdf_path, latest_pdf_path)
+
+        # 3. Jana Pautan Render Tanpa Iklan untuk QR Code
+        base_url = (os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:7860").rstrip("/")
+        direct_pdf_url = f"{base_url}/download-pdf?file={pdf_filename}"
         qr_img = generate_qr(direct_pdf_url)
 
         lokasi_info = place_name.strip() if place_name and place_name.strip() else f"`{lat:.6f}, {lon:.6f}`"
@@ -526,9 +538,14 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
 * **Koordinat:** `{lat:.6f}, {lon:.6f}`
 * **Arah Kiblat:** **{bearing:.4f}°** ({to_dms(bearing)}) dari Utara Sebenar
 * **Bayang Matahari:** 5 Hari bermula `{start_date_str}`
-* **Status:** PDF sedia untuk diimbas.
+* **Status:** Dokumen rasmi sedia dimuat turun terus (Tanpa Iklan).
 """
-        qr_status = f"**Pautan Muat Turun:**\n[{direct_pdf_url}]({direct_pdf_url})"
+        qr_status = f"""
+**Pautan Muat Turun Terus (Pelayan Render):**
+[📄 Klik Sini Untuk Muat Turun Fail PDF]({direct_pdf_url})
+
+*(Disimpan secara selamat di pelayan selama 60 minit)*
+"""
         return map_html, info, df, qr_img, qr_status
 
     except Exception as e:
@@ -633,7 +650,6 @@ CSS = """
     border: 1px solid rgba(255, 255, 255, 0.3) !important;
 }
 
-/* Sepanduk Sambungan & Lencana Pemasa */
 .connection-banner {
     display: flex;
     align-items: center;
@@ -843,7 +859,6 @@ def generate_header_html():
   <div class="bcns-nav">Kiblat &amp; Analisis Suria</div>
 </div>
 
-<!-- Sepanduk Makluman Sambungan Pangkalan Data & Jam Pemasa 30 Saat -->
 <div id="connection-banner-box" class="connection-banner">
   <div class="connection-banner-text">
     <span style="font-size: 1.3rem;">📡</span>
@@ -854,13 +869,12 @@ def generate_header_html():
 
 <div class="hero">
   <h1>Penjana Bayang Matahari Selari Kiblat<br> </h1>
-  <p>Apps ini bertujuan untuk anda menentukan arah kiblat di lokasi anda, dan mementukan arah kiblat 
-  melaui bayang matahari. </p>
+  <p>Apps ini bertujuan untuk anda menentukan arah kiblat di lokasi anda, dan menentukan arah kiblat 
+  melalui bayang matahari.</p>
 </div>
 """
 
 
-# JavaScript rasmi Gradio untuk mengira detik (Countdown) 30 saat secara langsung
 COUNTDOWN_JS = """
 () => {
     let seconds = 30;
@@ -868,7 +882,6 @@ COUNTDOWN_JS = """
     const banner = document.getElementById("connection-banner-box");
     
     if (!timerBadge) return;
-    
     timerBadge.innerText = "⏳ 30s";
     
     const interval = setInterval(() => {
@@ -898,7 +911,6 @@ COUNTDOWN_JS = """
 with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan") as demo:
     gr.HTML(generate_header_html())
 
-    # Panduan Penggunaan Bernombor (Langkah Demi Langkah)
     with gr.Column(elem_classes="guide-box"):
         gr.Markdown(
             """
@@ -954,9 +966,36 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
         outputs=[map_out, info_out, table_out, qr_out, qr_text],
     )
 
-    # Kunci utama: Menjalankan skrip kiraan detik 30s sebaik sahaja aplikasi dimuatkan
     demo.load(fn=None, js=COUNTDOWN_JS)
+
+
+# ----------------------------------------------------------------------
+# 7. Pelayan FastAPI untuk Menyajikan Fail PDF Terus dari Render
+# ----------------------------------------------------------------------
+server = FastAPI()
+
+
+@server.get("/download-pdf")
+def direct_download_pdf(file: str = "laporan_terkini.pdf"):
+    """Endpoint selamat untuk muat turun terus fail PDF dari Render tanpa iklan."""
+    cleanup_old_pdfs(max_age_seconds=3600)
+    safe_name = os.path.basename(file)
+    target = os.path.join(PDF_STORAGE_DIR, safe_name)
+    if not os.path.exists(target):
+        target = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
+
+    if os.path.exists(target):
+        return FileResponse(
+            target,
+            media_type="application/pdf",
+            filename="Laporan_Kiblat_BCNS.pdf",
+        )
+    return {"status": "error", "message": "Fail PDF tidak dijumpai atau telah tamat tempoh (melebihi 60 minit)."}
+
+
+# Gabungkan aplikasi Gradio ke dalam pelayan FastAPI
+app = gr.mount_gradio_app(server, demo, path="/")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
