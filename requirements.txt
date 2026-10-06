@@ -1,0 +1,8 @@
+gradio
+folium
+falakpy
+pandas
+reportlab
+qrcode
+requests
+Pillow
