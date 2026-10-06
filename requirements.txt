@@ -6,3 +6,5 @@ reportlab
 qrcode
 requests
 Pillow
+fastapi
+uvicorn
