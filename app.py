@@ -1197,6 +1197,30 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
     demo.load(fn=None, js=COUNTDOWN_JS)
 
 
+# ----------------------------------------------------------------------
+# 7. Pelayan FastAPI untuk Menyajikan Fail PDF Terus dari Render
+# ----------------------------------------------------------------------
+server = FastAPI()
+
+
+@server.get("/download-pdf")
+def direct_download_pdf(file: str = "laporan_terkini.pdf"):
+    """Endpoint selamat untuk muat turun terus fail PDF dari Render tanpa iklan."""
+    cleanup_old_pdfs(max_age_seconds=3600)
+    safe_name = os.path.basename(file)
+    target = os.path.join(PDF_STORAGE_DIR, safe_name)
+    if not os.path.exists(target):
+        target = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
+
+    if os.path.exists(target):
+        return FileResponse(
+            target,
+            media_type="application/pdf",
+            filename="Laporan_Kiblat_BCNS.pdf",
+        )
+    return {"status": "error", "message": "Fail PDF tidak dijumpai atau telah tamat tempoh (melebihi 60 minit)."}
+
+
 # Gabungkan aplikasi Gradio ke dalam pelayan FastAPI
 app = gr.mount_gradio_app(server, demo, path="/")
 
