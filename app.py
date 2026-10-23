@@ -4,32 +4,43 @@ Aplikasi Kiblat Selari Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan
 - Peta Folium (FOV 100m, Garis 2 km, Fixed Zoom)
 - Analisis Suria Tetap 5 Hari (falakpy)
 - Penjana PDF Bersijil & Pop-up Kod QR Automatik
-- Sistem Keep-Alive Automatik (Ping setiap 10 minit)
-- Countdown Timer 30 Saat Berfungsi Sepenuhnya (Live Countdown)
-- Panduan Penggunaan Bernombor Lengkap & Mesra Pengguna
+- PDF disimpan di pelayan sendiri (endpoint /download-pdf), fallback ke tmpfiles.org
+- Sistem Keep-Alive Automatik (Ping setiap 10 minit, hanya di Render)
+- Countdown Timer 30 Saat Berfungsi Sepenuhnya
 
-Pasang : pip install gradio folium falakpy pandas reportlab qrcode[pil] requests Pillow
+Pasang : pip install gradio fastapi uvicorn folium falakpy pandas reportlab "qrcode[pil]" requests Pillow
 Jalan  : python app.py
+
+Pembolehubah persekitaran (pilihan):
+  PORT                 - port pelayan (lalai 7860)
+  RENDER_EXTERNAL_URL  - URL awam Render (ditetapkan automatik oleh Render)
+  CONTACT_EMAIL        - e-mel sebenar untuk User-Agent Nominatim
 """
 
 import base64
-from datetime import datetime, timedelta, timezone
+import glob
 import io
 import math
 import os
+import re
 import tempfile
-from fastapi import FastAPI               
-from fastapi.responses import FileResponse # 
 import threading
 import time
 import traceback
-from falakpy import qibla
+import uuid
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
 import folium
 import gradio as gr
 import pandas as pd
-from PIL import Image, ImageDraw
 import qrcode
 import requests
+import uvicorn
+from falakpy import qibla
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
+from PIL import Image, ImageDraw
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -46,6 +57,16 @@ KAABAH_LAT, KAABAH_LON = 21.422487, 39.826206
 FIXED_DAYS = 5
 LOGO_FILE = "logo.png"
 MY_TZ = timezone(timedelta(hours=8))  # Zon Masa Malaysia (UTC+8)
+DEFAULT_ELEVATION = 40  # meter (boleh diubah dalam antara muka)
+
+PORT = int(os.environ.get("PORT", 7860))
+PUBLIC_BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "balaicerap.ns@gmail.com")
+
+# Folder simpanan PDF (untuk endpoint /download-pdf)
+PDF_STORAGE_DIR = os.path.join(tempfile.gettempdir(), "kiblat_pdfs")
+os.makedirs(PDF_STORAGE_DIR, exist_ok=True)
+PDF_MAX_AGE_SECONDS = 3600
 
 
 def get_malaysia_today_str():
@@ -53,23 +74,36 @@ def get_malaysia_today_str():
     return datetime.now(MY_TZ).strftime("%Y-%m-%d")
 
 
+def cleanup_old_pdfs(max_age_seconds=PDF_MAX_AGE_SECONDS):
+    """Memadam fail PDF yang lebih lama daripada had masa."""
+    now = time.time()
+    for path in glob.glob(os.path.join(PDF_STORAGE_DIR, "*.pdf")):
+        try:
+            if now - os.path.getmtime(path) > max_age_seconds:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 # ----------------------------------------------------------------------
 # 0. Pemantau Percuma (Keep-Alive Self-Ping Setiap 10 Minit)
 # ----------------------------------------------------------------------
 def start_keep_alive_monitor(interval_seconds=600):
-    """Bebenang latar yang memanggil URL pelayan setiap 10 minit untuk mengelakkan mod tidur."""
+    """Ping URL awam setiap 10 minit. Hanya aktif jika RENDER_EXTERNAL_URL ditetapkan,
+    kerana ping ke localhost tidak menghalang Render daripada tidur."""
+    if not PUBLIC_BASE_URL:
+        return
+
     def ping_worker():
-        time.sleep(25)  # Tunggu pelayan mula beroperasi sepenuhnya
+        time.sleep(25)
         while True:
             try:
-                target_url = os.environ.get("RENDER_EXTERNAL_URL") or "http://127.0.0.1:7860"
-                requests.get(target_url, timeout=12)
+                requests.get(PUBLIC_BASE_URL, timeout=12)
             except Exception:
                 pass
             time.sleep(interval_seconds)
 
-    thread = threading.Thread(target=ping_worker, daemon=True)
-    thread.start()
+    threading.Thread(target=ping_worker, daemon=True).start()
 
 
 start_keep_alive_monitor()
@@ -91,10 +125,10 @@ def get_logo_b64(filepath=LOGO_FILE):
 # ----------------------------------------------------------------------
 def search_location(place_name):
     if not place_name or not place_name.strip():
-        return None, None, "⚠️ Sila masukkan nama tempat atau alamat."
+        return gr.update(), gr.update(), "⚠️ Sila masukkan nama tempat atau alamat."
 
     url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "AplikasiKiblatMalaysia/2.0 (contact@kiblat.local)"}
+    headers = {"User-Agent": f"AplikasiKiblatMalaysia/2.1 ({CONTACT_EMAIL})"}
     params = {"q": place_name.strip(), "format": "json", "limit": 1}
 
     try:
@@ -103,7 +137,7 @@ def search_location(place_name):
         data = res.json()
 
         if not data:
-            return None, None, "❌ Lokasi tidak dijumpai. Cuba kata kunci lain."
+            return gr.update(), gr.update(), "❌ Lokasi tidak dijumpai. Cuba kata kunci lain."
 
         lat = round(float(data[0]["lat"]), 6)
         lon = round(float(data[0]["lon"]), 6)
@@ -111,7 +145,7 @@ def search_location(place_name):
         msg = f"✅ **Lokasi Ditemui:**\n{display_name}\n\n*Koordinat: `{lat}, {lon}`*"
         return lat, lon, msg
     except Exception as e:
-        return None, None, f"❌ Ralat carian lokasi: {e}"
+        return gr.update(), gr.update(), f"❌ Ralat carian lokasi: {e}"
 
 
 # ----------------------------------------------------------------------
@@ -126,10 +160,12 @@ def qibla_bearing(lat, lon):
 
 
 def to_dms(deg):
-    d = int(deg)
-    m = int((deg - d) * 60)
-    s = ((deg - d) * 60 - m) * 60
-    return f"{d}° {m}' {s:.1f}\""
+    """Darjah/minit/saat dengan pengendalian bundar (elak 60.0")."""
+    tenths = int(round(abs(deg) * 3600 * 10))  # unit 0.1 saat
+    d, rem = divmod(tenths, 3600 * 10)
+    m, s10 = divmod(rem, 60 * 10)
+    sign = "-" if deg < 0 else ""
+    return f"{sign}{d}° {m}' {s10 / 10:.1f}\""
 
 
 def destination_point(lat, lon, bearing_deg, distance_m=2000):
@@ -152,7 +188,7 @@ def destination_point(lat, lon, bearing_deg, distance_m=2000):
 def make_folium_map(lat, lon, bearing):
     end_lat, end_lon = destination_point(lat, lon, bearing, 2000)
     d_lat = 50.0 / 111320.0
-    d_lon = 50.0 / (111320.0 * math.cos(math.radians(lat)))
+    d_lon = 50.0 / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
 
     m = folium.Map(
         location=[lat, lon],
@@ -281,8 +317,8 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements.append(Spacer(1, 8))
 
-    # 2. Gambarajah Kompas Kiblat
-    tmp_compass = os.path.join(tempfile.gettempdir(), f"cmp_{os.getpid()}.png")
+    # 2. Gambarajah Kompas Kiblat (fail sementara unik)
+    tmp_compass = os.path.join(tempfile.gettempdir(), f"cmp_{uuid.uuid4().hex}.png")
     save_compass_image(bearing, tmp_compass)
     compass_img = RLImage(tmp_compass, width=95, height=95)
     compass_img.hAlign = "CENTER"
@@ -291,26 +327,18 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
 
     # 3. Parameter Analisis
     lokasi_str = place_name.strip() if place_name and place_name.strip() else f"{lat:.6f}, {lon:.6f}"
+    # Escape aksara khas supaya Paragraph reportlab tidak ralat
+    lokasi_safe = lokasi_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     meta_data = [
         [
             "Nama Tempat:",
-            Paragraph(lokasi_str, cell_meta_style),
+            Paragraph(lokasi_safe, cell_meta_style),
             "Arah Kiblat:",
             f"{bearing:.4f}° ({to_dms(bearing)})",
         ],
-        [
-            "Koordinat:",
-            f"{lat:.6f}, {lon:.6f}",
-            "Tarikh Mula:",
-            str(start_date),
-        ],
-        [
-            "Kaedah:",
-            "Great-Circle & Solar Transit [falakpy]",
-            "",
-            "",
-        ],
+        ["Koordinat:", f"{lat:.6f}, {lon:.6f}", "Tarikh Mula:", str(start_date)],
+        ["Kaedah:", "Great-Circle & Solar Transit [falakpy]", "", ""],
     ]
     t_meta = Table(meta_data, colWidths=[85, 175, 85, 175])
     t_meta.setStyle(
@@ -357,25 +385,18 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
                 col_widths.append(125)
             elif "Sesi" in c:
                 col_widths.append(60)
-            elif "Awal" in c:
-                col_widths.append(134)
-            elif "Akhir" in c:
+            elif "Awal" in c or "Akhir" in c:
                 col_widths.append(134)
             else:
                 col_widths.append((A4[0] - 72) / len(cols))
 
-        t_data = Table(rows, colWidths=col_widths)
+        t_data = Table(rows, colWidths=col_widths, repeatRows=1)
         t_data.setStyle(
             TableStyle(
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2D5A60")),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
-                    (
-                        "ROWBACKGROUNDS",
-                        (0, 1),
-                        (-1, -1),
-                        [colors.white, colors.HexColor("#F8FAFC")],
-                    ),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
                     ("TOPPADDING", (0, 0), (-1, -1), 4),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -384,20 +405,22 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
         )
         elements.append(t_data)
 
-    doc.build(
-        elements,
-        onFirstPage=draw_pdf_canvas_frame,
-        onLaterPages=draw_pdf_canvas_frame,
-    )
-
-    if os.path.exists(tmp_compass):
-        try:
-            os.remove(tmp_compass)
-        except OSError:
-            pass
+    try:
+        doc.build(
+            elements,
+            onFirstPage=draw_pdf_canvas_frame,
+            onLaterPages=draw_pdf_canvas_frame,
+        )
+    finally:
+        if os.path.exists(tmp_compass):
+            try:
+                os.remove(tmp_compass)
+            except OSError:
+                pass
 
 
 def upload_pdf(pdf_path):
+    """Fallback: muat naik ke tmpfiles.org (sementara sahaja)."""
     url = "https://tmpfiles.org/api/v1/upload"
     headers = {"User-Agent": "Mozilla/5.0"}
     with open(pdf_path, "rb") as f:
@@ -405,6 +428,13 @@ def upload_pdf(pdf_path):
     res.raise_for_status()
     raw_url = res.json()["data"]["url"]
     return raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+
+def get_pdf_public_url(pdf_path):
+    """Guna pelayan sendiri jika URL awam diketahui (Render); jika tidak, fallback tmpfiles."""
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/download-pdf?file={quote(os.path.basename(pdf_path))}"
+    return upload_pdf(pdf_path)
 
 
 def generate_qr(target_url):
@@ -420,14 +450,13 @@ def generate_qr(target_url):
 
 
 def build_qr_popup_html(qr_img, direct_pdf_url, lokasi_str, bearing_deg):
-    """Membina tetingkap Pop-up Modal HTML dengan Kod QR sebaik sahaja kiraan selesai."""
+    """Pop-up modal. Butang tutup ialah butang Gradio (lebih dipercayai berbanding trik checkbox)."""
     buffered = io.BytesIO()
     qr_img.save(buffered, format="PNG")
     qr_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    modal_id = f"qr_modal_{int(time.time() * 1000)}"
+    lokasi_safe = lokasi_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     return f"""
-<input type="checkbox" id="{modal_id}" class="qr-modal-toggle" />
 <div class="qr-modal-overlay">
   <div class="qr-modal-card">
     <div class="qr-modal-badge">✅ LAPORAN SIAP DIJANA</div>
@@ -438,16 +467,13 @@ def build_qr_popup_html(qr_img, direct_pdf_url, lokasi_str, bearing_deg):
       <img src="data:image/png;base64,{qr_b64}" alt="Kod QR Laporan Kiblat" />
     </div>
     <p class="qr-modal-meta">
-      <strong>Lokasi:</strong> {lokasi_str}<br>
+      <strong>Lokasi:</strong> {lokasi_safe}<br>
       <strong>Arah Kiblat:</strong> {bearing_deg:.2f}° ({to_dms(bearing_deg)})
     </p>
     <div class="qr-modal-btn-group">
       <a href="{direct_pdf_url}" target="_blank" rel="noopener noreferrer" class="qr-modal-dl">
         📄 Muat Turun PDF Terus
       </a>
-      <label for="{modal_id}" class="qr-modal-close">
-        ✖ Tutup Pop-up
-      </label>
     </div>
   </div>
 </div>
@@ -457,7 +483,39 @@ def build_qr_popup_html(qr_img, direct_pdf_url, lokasi_str, bearing_deg):
 # ----------------------------------------------------------------------
 # 4. Aliran Pemprosesan Utama
 # ----------------------------------------------------------------------
-def process_data(lat, lon, start_date_str, tz, place_name=""):
+def _parse_hour(val):
+    """Ambil jam (0-23) daripada teks seperti '12:30', '12:30:15' atau '1:05 PM'."""
+    if val is None or pd.isna(val):
+        return None
+    s = str(val).strip()
+    if s in ("", "-", "None", "nan"):
+        return None
+    m = re.search(r"(\d{1,2})\s*:\s*\d{2}", s)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    low = s.lower()
+    if "pm" in low and hour < 12:
+        hour += 12
+    elif "am" in low and hour == 12:
+        hour = 0
+    return hour if 0 <= hour <= 23 else None
+
+
+def tentukan_sesi(val):
+    jam = _parse_hour(val)
+    if jam is None:
+        return "-"
+    if jam < 12:
+        return "Pagi"
+    if jam < 14:
+        return "Tengah Hari"
+    return "Petang"
+
+
+def process_data(lat, lon, start_date_str, tz, ele, place_name=""):
+    hide_close = gr.update(visible=False)
+
     if lat is None or lon is None:
         err_msg = "⚠️ Sila cari nama tempat atau masukkan koordinat terlebih dahulu."
         return (
@@ -467,21 +525,36 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             Image.new("RGB", (200, 200), color=(240, 240, 240)),
             "",
             "",
+            hide_close,
         )
 
+    csv_tmp = os.path.join(tempfile.gettempdir(), f"qibla_5d_{uuid.uuid4().hex}.csv")
     try:
         bearing = qibla_bearing(lat, lon)
         map_html = make_folium_map(lat, lon, bearing)
 
-        # 1. Analisis Suria Tetap 5 Hari (falakpy)
-        dt = datetime.strptime(start_date_str.strip(), "%Y-%m-%d")
-        csv_tmp = os.path.join(tempfile.gettempdir(), f"qibla_5d_{os.getpid()}.csv")
+        try:
+            dt = datetime.strptime((start_date_str or "").strip(), "%Y-%m-%d")
+        except ValueError:
+            msg = "⚠️ Format tarikh tidak sah. Gunakan YYYY-MM-DD (contoh: 2026-10-23)."
+            return (
+                map_html,
+                msg,
+                pd.DataFrame({"Status": ["Tarikh tidak sah"]}),
+                Image.new("RGB", (200, 200), color=(240, 240, 240)),
+                "",
+                "",
+                hide_close,
+            )
 
+        elevation = DEFAULT_ELEVATION if ele is None else float(ele)
+
+        # 1. Analisis Suria Tetap 5 Hari (falakpy)
         qibla.multiday_qibla(
             lat=lat,
             lon=lon,
-            ele=40,
-            timezone=float(tz),
+            ele=elevation,
+            timezone=float(tz if tz is not None else 8),
             y=dt.year,
             m=dt.month,
             d_start=dt.day,
@@ -495,8 +568,6 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             if os.path.exists(csv_tmp)
             else pd.DataFrame({"Status": ["Tiada jajaran ditemui"]})
         )
-        if os.path.exists(csv_tmp):
-            os.remove(csv_tmp)
 
         rename_map = {}
         for c in df.columns:
@@ -509,7 +580,6 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
                 rename_map[c] = "Waktu Awal Bayang Selari Kiblat"
             elif "exit" in c_low:
                 rename_map[c] = "Waktu Akhir Bayang Selari Kiblat"
-
         df = df.rename(columns=rename_map)
 
         if "Kedudukan Bayang" in df.columns:
@@ -524,20 +594,6 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
                     "opposite": "Bayang membelakangi kiblat",
                 })
             )
-
-        def tentukan_sesi(val):
-            if pd.isna(val) or str(val).strip() in ["-", "", "None"]:
-                return "-"
-            try:
-                jam = int(str(val).split(":")[0])
-                if jam < 12:
-                    return "Pagi"
-                elif 12 <= jam < 14:
-                    return "Tengah Hari"
-                else:
-                    return "Petang"
-            except Exception:
-                return "-"
 
         if "Waktu Awal Bayang Selari Kiblat" in df.columns:
             df["Sesi"] = df["Waktu Awal Bayang Selari Kiblat"].apply(tentukan_sesi)
@@ -554,14 +610,14 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             ]
             df = df[urutan]
 
-        # 2. Bina Dokumen PDF
-        pdf_path = os.path.join(
-            tempfile.gettempdir(), f"Laporan_Kiblat_{dt.strftime('%Y%m%d')}.pdf"
-        )
-        create_pdf(lat, lon, bearing, df, start_date_str, place_name, pdf_path)
+        # 2. Bina Dokumen PDF (nama unik dalam PDF_STORAGE_DIR)
+        cleanup_old_pdfs()
+        pdf_name = f"Laporan_Kiblat_{dt.strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}.pdf"
+        pdf_path = os.path.join(PDF_STORAGE_DIR, pdf_name)
+        create_pdf(lat, lon, bearing, df, start_date_str.strip(), place_name, pdf_path)
 
-        # 3. Muat Naik & QR
-        direct_pdf_url = upload_pdf(pdf_path)
+        # 3. URL awam & QR
+        direct_pdf_url = get_pdf_public_url(pdf_path)
         qr_img = generate_qr(direct_pdf_url)
 
         lokasi_clean = place_name.strip() if place_name and place_name.strip() else f"{lat:.6f}, {lon:.6f}"
@@ -570,26 +626,36 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
 * **Lokasi / Premis:** {lokasi_clean}
 * **Koordinat:** `{lat:.6f}, {lon:.6f}`
 * **Arah Kiblat:** **{bearing:.4f}°** ({to_dms(bearing)}) dari Utara Sebenar
-* **Bayang Matahari:** 5 Hari bermula `{start_date_str}`
+* **Bayang Matahari:** 5 Hari bermula `{start_date_str.strip()}`
 * **Status:** PDF sedia untuk diimbas.
 """
         qr_status = f"**Pautan Muat Turun:**\n[{direct_pdf_url}]({direct_pdf_url})"
 
-        # 4. Bina Pop-up Kod QR
+        # 4. Pop-up Kod QR
         popup_html = build_qr_popup_html(qr_img, direct_pdf_url, lokasi_clean, bearing)
 
-        return map_html, info, df, qr_img, qr_status, popup_html
+        return map_html, info, df, qr_img, qr_status, popup_html, gr.update(visible=True)
 
     except Exception as e:
         traceback.print_exc()
         err_msg = f"❌ **Ralat:** `{type(e).__name__}: {str(e)}`"
         empty_df = pd.DataFrame({"Ralat": [str(e)]})
         dummy_img = Image.new("RGB", (200, 200), color=(240, 240, 240))
-        return "<p style='color:red;'>Ralat pemprosesan.</p>", err_msg, empty_df, dummy_img, err_msg, ""
+        return "<p style='color:red;'>Ralat pemprosesan.</p>", err_msg, empty_df, dummy_img, err_msg, "", hide_close
+    finally:
+        if os.path.exists(csv_tmp):
+            try:
+                os.remove(csv_tmp)
+            except OSError:
+                pass
+
+
+def close_popup():
+    return "", gr.update(visible=False)
 
 
 # ----------------------------------------------------------------------
-# 5. Antara Muka Gradio & Gaya CSS
+# 5. Gaya CSS
 # ----------------------------------------------------------------------
 CSS = """
 .gradio-container {
@@ -682,7 +748,6 @@ CSS = """
     border: 1px solid rgba(255, 255, 255, 0.3) !important;
 }
 
-/* Sepanduk Sambungan & Lencana Pemasa */
 .connection-banner {
     display: flex;
     align-items: center;
@@ -729,9 +794,7 @@ CSS = """
     transition: all 0.3s ease;
 }
 
-.hero {
-    padding: 6px 4px 14px;
-}
+.hero { padding: 6px 4px 14px; }
 
 .hero h1 {
     color: #2D5A60 !important;
@@ -741,9 +804,7 @@ CSS = """
     margin: 0 0 8px;
 }
 
-.dark .hero h1 {
-    color: #5EEAD4 !important;
-}
+.dark .hero h1 { color: #5EEAD4 !important; }
 
 .hero h1::after {
     content: "";
@@ -763,9 +824,7 @@ CSS = """
     max-width: 820px;
 }
 
-.dark .hero p {
-    color: #CBD5E1 !important;
-}
+.dark .hero p { color: #CBD5E1 !important; }
 
 .guide-box {
     background: #FFFFFF;
@@ -776,10 +835,7 @@ CSS = """
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
 }
 
-.dark .guide-box {
-    background: #1E293B;
-    border-color: #334155;
-}
+.dark .guide-box { background: #1E293B; border-color: #334155; }
 
 .card {
     background: #FFFFFF !important;
@@ -789,10 +845,7 @@ CSS = """
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02) !important;
 }
 
-.dark .card {
-    background: #1E293B !important;
-    border-color: #334155 !important;
-}
+.dark .card { background: #1E293B !important; border-color: #334155 !important; }
 
 .band {
     background: linear-gradient(135deg, #2D5A60 0%, #3B6E75 100%);
@@ -819,16 +872,9 @@ CSS = """
     margin-top: 6px;
 }
 
-.dark .gradio-container h3 {
-    color: #5EEAD4 !important;
-    border-bottom-color: #334155;
-}
+.dark .gradio-container h3 { color: #5EEAD4 !important; border-bottom-color: #334155; }
 
-.map-card {
-    border-radius: 14px;
-    overflow: hidden;
-    border: 1px solid #CBD5E1;
-}
+.map-card { border-radius: 14px; overflow: hidden; border: 1px solid #CBD5E1; }
 
 .gradio-container table thead,
 .gradio-container table thead tr,
@@ -862,9 +908,7 @@ CSS = """
 }
 
 .gradio-container table tbody td,
-.gradio-container .table-wrap tbody td {
-    color: #1E293B !important;
-}
+.gradio-container .table-wrap tbody td { color: #1E293B !important; }
 
 .dark .gradio-container table tbody td,
 .dark .gradio-container .table-wrap tbody td {
@@ -872,7 +916,6 @@ CSS = """
     background-color: #1E293B !important;
 }
 
-/* Butang Khas 'Cari Lokasi' (Menonjol & Interaktif) */
 .btn-search-special {
     background: linear-gradient(135deg, #D97706 0%, #B45309 100%) !important;
     color: #FFFFFF !important;
@@ -895,28 +938,14 @@ CSS = """
 }
 
 @keyframes pulse-search {
-    0% {
-        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.7);
-    }
-    70% {
-        box-shadow: 0 0 0 10px rgba(245, 158, 11, 0);
-    }
-    100% {
-        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0);
-    }
+    0%   { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.7); }
+    70%  { box-shadow: 0 0 0 10px rgba(245, 158, 11, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
 }
 
 /* ============================================================== */
-/* GAYA TETINGKAP POP-UP KOD QR (MODAL OVERLAY)                   */
+/* POP-UP KOD QR (MODAL OVERLAY)                                  */
 /* ============================================================== */
-.qr-modal-toggle {
-    display: none !important;
-}
-
-.qr-modal-toggle:checked + .qr-modal-overlay {
-    display: none !important;
-}
-
 .qr-modal-overlay {
     position: fixed;
     inset: 0;
@@ -926,7 +955,7 @@ CSS = """
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 16px;
+    padding: 16px 16px 90px;
     animation: qrPopupFadeIn 0.3s ease-out;
 }
 
@@ -936,17 +965,15 @@ CSS = """
     border-radius: 20px;
     max-width: 440px;
     width: 100%;
+    max-height: 100%;
+    overflow-y: auto;
     padding: 26px 24px;
     text-align: center;
     box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
     animation: qrPopupScaleUp 0.3s ease-out;
 }
 
-.dark .qr-modal-card {
-    background: #1E293B;
-    border-color: #D4AF37;
-    color: #F8FAFC;
-}
+.dark .qr-modal-card { background: #1E293B; border-color: #D4AF37; color: #F8FAFC; }
 
 .qr-modal-badge {
     display: inline-block;
@@ -970,9 +997,7 @@ CSS = """
     padding: 0 !important;
 }
 
-.dark .qr-modal-title {
-    color: #5EEAD4 !important;
-}
+.dark .qr-modal-title { color: #5EEAD4 !important; }
 
 .qr-modal-img-box {
     background: #FFFFFF;
@@ -983,28 +1008,12 @@ CSS = """
     margin-bottom: 14px;
 }
 
-.qr-modal-img-box img {
-    width: 210px;
-    height: 210px;
-    display: block;
-}
+.qr-modal-img-box img { width: 210px; height: 210px; display: block; }
 
-.qr-modal-meta {
-    font-size: 0.88rem;
-    color: #475569;
-    line-height: 1.5;
-    margin: 0 0 18px 0;
-}
+.qr-modal-meta { font-size: 0.88rem; color: #475569; line-height: 1.5; margin: 0 0 18px 0; }
+.dark .qr-modal-meta { color: #CBD5E1; }
 
-.dark .qr-modal-meta {
-    color: #CBD5E1;
-}
-
-.qr-modal-btn-group {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
+.qr-modal-btn-group { display: flex; flex-direction: column; gap: 10px; }
 
 .qr-modal-dl {
     background: linear-gradient(135deg, #2D5A60 0%, #23464B 100%);
@@ -1018,41 +1027,29 @@ CSS = """
     transition: opacity 0.2s;
 }
 
-.qr-modal-dl:hover {
-    opacity: 0.92;
-}
+.qr-modal-dl:hover { opacity: 0.92; }
 
-.qr-modal-close {
-    background: #F1F5F9;
+/* Butang tutup Gradio, diletakkan di atas overlay */
+.qr-close-btn {
+    position: fixed !important;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100000 !important;
+    width: auto !important;
+    min-width: 200px;
+    background: #F1F5F9 !important;
     color: #334155 !important;
-    font-weight: 700;
-    font-size: 0.92rem;
-    padding: 10px 18px;
-    border-radius: 10px;
-    border: 1px solid #CBD5E1;
-    cursor: pointer;
-    display: block;
-    transition: background 0.2s;
+    font-weight: 700 !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 10px !important;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3) !important;
 }
 
-.dark .qr-modal-close {
-    background: #334155;
-    color: #F8FAFC !important;
-    border-color: #475569;
-}
-
-.qr-modal-close:hover {
-    background: #E2E8F0;
-}
-
-@keyframes qrPopupFadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-}
-
+@keyframes qrPopupFadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes qrPopupScaleUp {
     from { transform: scale(0.9); opacity: 0; }
-    to { transform: scale(1); opacity: 1; }
+    to   { transform: scale(1);   opacity: 1; }
 }
 """
 
@@ -1064,6 +1061,7 @@ def generate_header_html():
         if b64_str
         else ""
     )
+    # <style> disertakan sebagai sandaran jika css= tidak diterima oleh versi Gradio
     return f"""
 <style>{CSS}</style>
 <div class="ns-strip"></div>
@@ -1075,7 +1073,6 @@ def generate_header_html():
   <div class="bcns-nav">Kiblat &amp; Analisis Suria</div>
 </div>
 
-<!-- Sepanduk Makluman Sambungan Pangkalan Data & Jam Pemasa 30 Saat -->
 <div id="connection-banner-box" class="connection-banner">
   <div class="connection-banner-text">
     <span style="font-size: 1.3rem;">📡</span>
@@ -1091,55 +1088,72 @@ def generate_header_html():
 """
 
 
-# JavaScript rasmi Gradio untuk mengira detik (Countdown) 30 saat secara langsung
+# JavaScript: tunggu elemen wujud (dirender kemudian oleh gr.HTML), kemudian mula kira detik
 COUNTDOWN_JS = """
 () => {
-    let seconds = 30;
-    const timerBadge = document.getElementById("connection-timer");
-    const banner = document.getElementById("connection-banner-box");
-
-    if (!timerBadge) return;
-
-    timerBadge.innerText = "⏳ 30s";
-
-    const interval = setInterval(() => {
-        seconds--;
-        if (seconds > 0) {
-            timerBadge.innerText = "⏳ " + seconds + "s";
-        } else {
-            timerBadge.innerText = "✅ Sedia";
-            timerBadge.style.background = "#059669";
-            clearInterval(interval);
-            setTimeout(() => {
-                if (banner) {
-                    banner.style.transition = "opacity 0.8s ease";
-                    banner.style.opacity = "0";
-                    setTimeout(() => { banner.style.display = "none"; }, 800);
-                }
-            }, 2500);
+    let tries = 0;
+    const waiter = setInterval(() => {
+        const timerBadge = document.getElementById("connection-timer");
+        const banner = document.getElementById("connection-banner-box");
+        tries++;
+        if (!timerBadge) {
+            if (tries > 40) clearInterval(waiter);  // henti selepas ~20 saat
+            return;
         }
-    }, 1000);
+        clearInterval(waiter);
+
+        let seconds = 30;
+        timerBadge.innerText = "⏳ " + seconds + "s";
+        const interval = setInterval(() => {
+            seconds--;
+            if (seconds > 0) {
+                timerBadge.innerText = "⏳ " + seconds + "s";
+            } else {
+                timerBadge.innerText = "✅ Sedia";
+                timerBadge.style.background = "#059669";
+                clearInterval(interval);
+                setTimeout(() => {
+                    if (banner) {
+                        banner.style.transition = "opacity 0.8s ease";
+                        banner.style.opacity = "0";
+                        setTimeout(() => { banner.style.display = "none"; }, 800);
+                    }
+                }, 2500);
+            }
+        }, 1000);
+    }, 500);
 }
 """
 
 
 # ----------------------------------------------------------------------
-# 6. Membina Antara Muka Gradio
+# 6. Antara Muka Gradio
 # ----------------------------------------------------------------------
-with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan") as demo:
+BLOCKS_TITLE = "Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan"
+
+
+def make_blocks():
+    """Cuba css= pada Blocks; jika versi Gradio tidak menerimanya, guna <style> dalam gr.HTML."""
+    try:
+        return gr.Blocks(title=BLOCKS_TITLE, css=CSS)
+    except TypeError:
+        return gr.Blocks(title=BLOCKS_TITLE)
+
+
+with make_blocks() as demo:
     gr.HTML(generate_header_html())
 
-    # Komponen Pop-up Modal QR Code (muncul automatik apabila siap dijana)
+    # Pop-up QR + butang tutup
     popup_out = gr.HTML()
+    btn_close = gr.Button("✖ Tutup Pop-up", visible=False, elem_classes=["qr-close-btn"])
 
-    # Panduan Penggunaan Bernombor (Langkah Demi Langkah)
     with gr.Column(elem_classes="guide-box"):
         gr.Markdown(
             """
 ### 📋 Panduan Penggunaan (5 Langkah Mudah)
 1. **Cari Lokasi:** Masukkan nama tempat, masjid, atau alamat premis anda pada ruangan carian, kemudian klik butang **👉 KLIK SINI DAHULU: CARI LOKASI 🔍**.
 2. **Sahkan Parameter:** Koordinat latitud, longitud, dan tarikh mula akan terisi secara automatik (anda boleh menukar tarikh jika perlu).
-3. **Jana Laporan:** Klik butang **Jana Pengiraan & QR** untuk memulakan pengiraan bayang matahari selari dengan arahb Kiablat.
+3. **Jana Laporan:** Klik butang **Jana Laporan (5 Hari) & QR** untuk memulakan pengiraan bayang matahari selari dengan arah Kiblat.
 4. **Imbas Pop-up Kod QR:** Tetingkap **Kod QR** akan terpapar secara automatik di skrin—imbas menggunakan telefon pintar anda untuk memuat turun PDF.
 5. **Semak Unjuran & Jadual:** Tutup *pop-up* jika anda ingin memeriksa garisan kiblat (2.0 km) pada peta interaktif dan jadual waktu bayang matahari di bawah.
 """
@@ -1163,8 +1177,8 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
             gr.Markdown("### 2. Parameter Analisis")
             lat_in = gr.Number(label="Latitud", value=3.139000, precision=6)
             lon_in = gr.Number(label="Longitud", value=101.686900, precision=6)
+            ele_in = gr.Number(label="Altitud (meter)", value=DEFAULT_ELEVATION, precision=0)
 
-            # Dinamik mengikut tarikh semasa Malaysia (UTC+8)
             date_in = gr.Textbox(
                 label="Tarikh Mula (YYYY-MM-DD)",
                 value=get_malaysia_today_str,
@@ -1191,41 +1205,44 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
 
     btn_run.click(
         process_data,
-        inputs=[lat_in, lon_in, date_in, tz_in, search_input],
-        outputs=[map_out, info_out, table_out, qr_out, qr_text, popup_out],
+        inputs=[lat_in, lon_in, date_in, tz_in, ele_in, search_input],
+        outputs=[map_out, info_out, table_out, qr_out, qr_text, popup_out, btn_close],
     )
 
-    # Menjalankan skrip kiraan detik 30s sebaik sahaja aplikasi dimuatkan
+    btn_close.click(close_popup, inputs=None, outputs=[popup_out, btn_close])
+
     demo.load(fn=None, js=COUNTDOWN_JS)
 
 
 # ----------------------------------------------------------------------
-# 7. Pelayan FastAPI untuk Menyajikan Fail PDF Terus dari Render
+# 7. Pelayan FastAPI (muat turun PDF terus dari Render)
 # ----------------------------------------------------------------------
 server = FastAPI()
 
 
 @server.get("/download-pdf")
-def direct_download_pdf(file: str = "laporan_terkini.pdf"):
-    """Endpoint selamat untuk muat turun terus fail PDF dari Render tanpa iklan."""
-    cleanup_old_pdfs(max_age_seconds=3600)
+def direct_download_pdf(file: str = ""):
+    """Muat turun terus fail PDF yang dijana (tanpa iklan, tamat tempoh 60 minit)."""
+    cleanup_old_pdfs()
     safe_name = os.path.basename(file)
-    target = os.path.join(PDF_STORAGE_DIR, safe_name)
-    if not os.path.exists(target):
-        target = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
+    if not safe_name.lower().endswith(".pdf"):
+        return JSONResponse({"status": "error", "message": "Nama fail tidak sah."}, status_code=400)
 
+    target = os.path.join(PDF_STORAGE_DIR, safe_name)
     if os.path.exists(target):
         return FileResponse(
             target,
             media_type="application/pdf",
             filename="Laporan_Kiblat_BCNS.pdf",
         )
-    return {"status": "error", "message": "Fail PDF tidak dijumpai atau telah tamat tempoh (melebihi 60 minit)."}
+    return JSONResponse(
+        {"status": "error", "message": "Fail PDF tidak dijumpai atau telah tamat tempoh (melebihi 60 minit)."},
+        status_code=404,
+    )
 
 
-# Gabungkan aplikasi Gradio ke dalam pelayan FastAPI
+# Route di atas mesti didaftar SEBELUM Gradio di-mount pada "/"
 app = gr.mount_gradio_app(server, demo, path="/")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
