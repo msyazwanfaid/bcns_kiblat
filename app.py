@@ -943,6 +943,34 @@ CSS = """
     100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
 }
 
+/* Butang Langkah 2 (hijau-teal, menonjol) */
+.btn-generate-special {
+    background: linear-gradient(135deg, #059669 0%, #047857 100%) !important;
+    color: #FFFFFF !important;
+    font-weight: 800 !important;
+    font-size: 1.02rem !important;
+    letter-spacing: 0.02em !important;
+    border: 2px solid #A7F3D0 !important;
+    border-radius: 10px !important;
+    padding: 10px 16px !important;
+    box-shadow: 0 4px 14px rgba(5, 150, 105, 0.4) !important;
+    cursor: pointer !important;
+    transition: all 0.25s ease-in-out !important;
+    animation: pulse-generate 2.2s infinite !important;
+}
+
+.btn-generate-special:hover {
+    transform: translateY(-2px) scale(1.02) !important;
+    box-shadow: 0 6px 18px rgba(5, 150, 105, 0.6) !important;
+    background: linear-gradient(135deg, #047857 0%, #065F46 100%) !important;
+}
+
+@keyframes pulse-generate {
+    0%   { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.7); }
+    70%  { box-shadow: 0 0 0 10px rgba(5, 150, 105, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0); }
+}
+
 /* ============================================================== */
 /* POP-UP KOD QR (MODAL OVERLAY)                                  */
 /* ============================================================== */
@@ -1150,12 +1178,11 @@ with make_blocks() as demo:
     with gr.Column(elem_classes="guide-box"):
         gr.Markdown(
             """
-### 📋 Panduan Penggunaan (5 Langkah Mudah)
-1. **Cari Lokasi:** Masukkan nama tempat, masjid, atau alamat premis anda pada ruangan carian, kemudian klik butang **👉 KLIK SINI DAHULU: CARI LOKASI 🔍**.
-2. **Sahkan Parameter:** Koordinat latitud, longitud, dan tarikh mula akan terisi secara automatik (anda boleh menukar tarikh jika perlu).
-3. **Jana Laporan:** Klik butang **Jana Laporan (5 Hari) & QR** untuk memulakan pengiraan bayang matahari selari dengan arah Kiblat.
-4. **Imbas Pop-up Kod QR:** Tetingkap **Kod QR** akan terpapar secara automatik di skrin—imbas menggunakan telefon pintar anda untuk memuat turun PDF.
-5. **Semak Unjuran & Jadual:** Tutup *pop-up* jika anda ingin memeriksa garisan kiblat (2.0 km) pada peta interaktif dan jadual waktu bayang matahari di bawah.
+### 📋 Panduan Penggunaan (Hanya 2 Langkah)
+1. **Langkah 1 – Cari Lokasi:** Taip nama tempat, masjid atau alamat anda, kemudian klik butang **Langkah 1 : Cari Lokasi**. Koordinat akan terisi sendiri.
+2. **Langkah 2 – Jana Laporan:** Semak tarikh mula (lalai: hari ini, tukar jika perlu), kemudian klik butang **Langkah 2 : Jana Pengiraan Kiblat & QR**.
+3. **Imbas Kod QR:** Tetingkap pop-up akan keluar sendiri. Imbas kod QR dengan telefon untuk dapatkan PDF jadual bayang matahari selari kiblat.
+4. **Lihat Peta & Jadual:** Tutup pop-up untuk melihat garisan kiblat (2 km) pada peta dan jadual waktu bayang matahari 5 hari di bawah.
 """
         )
 
@@ -1168,7 +1195,7 @@ with make_blocks() as demo:
             )
 
             btn_search = gr.Button(
-                "👉 KLIK SINI DAHULU: CARI LOKASI 🔍",
+                "🔍 Langkah 1 : Cari Lokasi",
                 variant="primary",
                 elem_classes=["btn-search-special"],
             )
@@ -1184,7 +1211,11 @@ with make_blocks() as demo:
                 value=get_malaysia_today_str,
             )
             tz_in = gr.Number(label="Zon Masa (UTC)", value=8, precision=1)
-            btn_run = gr.Button("Jana Laporan (5 Hari) & QR", variant="primary")
+            btn_run = gr.Button(
+                "📄 Langkah 2 : Jana Pengiraan Kiblat & QR",
+                variant="primary",
+                elem_classes=["btn-generate-special"],
+            )
             info_out = gr.Markdown()
 
         with gr.Column(scale=2):
