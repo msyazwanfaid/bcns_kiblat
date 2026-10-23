@@ -3,25 +3,25 @@ Aplikasi Kiblat Selari Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan
 - Carian Lokasi Geocoding OpenStreetMap
 - Peta Folium (FOV 100m, Garis 2 km, Fixed Zoom)
 - Analisis Suria Tetap 5 Hari (falakpy)
-- Penjana PDF Bersijil & Muat Turun Kod QR (Hos Terus di Render - 0% Iklan)
-- Auto-Padam Fail PDF Melebihi 60 Minit
+- Penjana PDF Bersijil & Pop-up Kod QR Automatik
 - Sistem Keep-Alive Automatik (Ping setiap 10 minit)
 - Countdown Timer 30 Saat Berfungsi Sepenuhnya (Live Countdown)
 - Panduan Penggunaan Bernombor Lengkap & Mesra Pengguna
+
+Pasang : pip install gradio folium falakpy pandas reportlab qrcode[pil] requests Pillow
+Jalan  : python app.py
 """
 
 import base64
-from datetime import datetime, date
+from datetime import datetime, timedelta, timezone
+import io
 import math
 import os
-import shutil
 import tempfile
 import threading
 import time
 import traceback
 from falakpy import qibla
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
 import folium
 import gradio as gr
 import pandas as pd
@@ -39,38 +39,25 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-import uvicorn
 
 KAABAH_LAT, KAABAH_LON = 21.422487, 39.826206
 FIXED_DAYS = 5
 LOGO_FILE = "logo.png"
+MY_TZ = timezone(timedelta(hours=8))  # Zon Masa Malaysia (UTC+8)
 
-# Folder simpanan fail PDF di dalam pelayan Render
-PDF_STORAGE_DIR = "pdf_reports"
-os.makedirs(PDF_STORAGE_DIR, exist_ok=True)
+
+def get_malaysia_today_str():
+    """Mengambil tarikh semasa mengikut waktu tempatan Malaysia (UTC+8)."""
+    return datetime.now(MY_TZ).strftime("%Y-%m-%d")
 
 
 # ----------------------------------------------------------------------
-# 0. Pemantau Percuma (Keep-Alive) & Pembersihan PDF (60 Minit)
+# 0. Pemantau Percuma (Keep-Alive Self-Ping Setiap 10 Minit)
 # ----------------------------------------------------------------------
-def cleanup_old_pdfs(max_age_seconds=3600):
-    """Memadam fail PDF yang berusia lebih dari 60 minit secara automatik."""
-    now = time.time()
-    if os.path.exists(PDF_STORAGE_DIR):
-        for fname in os.listdir(PDF_STORAGE_DIR):
-            if fname.endswith(".pdf"):
-                fpath = os.path.join(PDF_STORAGE_DIR, fname)
-                try:
-                    if now - os.path.getmtime(fpath) > max_age_seconds:
-                        os.remove(fpath)
-                except Exception:
-                    pass
-
-
 def start_keep_alive_monitor(interval_seconds=600):
     """Bebenang latar yang memanggil URL pelayan setiap 10 minit untuk mengelakkan mod tidur."""
     def ping_worker():
-        time.sleep(25)
+        time.sleep(25)  # Tunggu pelayan mula beroperasi sepenuhnya
         while True:
             try:
                 target_url = os.environ.get("RENDER_EXTERNAL_URL") or "http://127.0.0.1:7860"
@@ -253,6 +240,7 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements = []
 
+    # 1. Header Laporan dengan Logo Balai Cerap Negeri Sembilan
     if os.path.exists(LOGO_FILE):
         try:
             logo_img = RLImage(LOGO_FILE, width=54, height=54)
@@ -291,6 +279,7 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements.append(Spacer(1, 8))
 
+    # 2. Gambarajah Kompas Kiblat
     tmp_compass = os.path.join(tempfile.gettempdir(), f"cmp_{os.getpid()}.png")
     save_compass_image(bearing, tmp_compass)
     compass_img = RLImage(tmp_compass, width=95, height=95)
@@ -298,6 +287,7 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     elements.append(compass_img)
     elements.append(Spacer(1, 10))
 
+    # 3. Parameter Analisis
     lokasi_str = place_name.strip() if place_name and place_name.strip() else f"{lat:.6f}, {lon:.6f}"
 
     meta_data = [
@@ -342,6 +332,7 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
     )
     elements.append(Spacer(1, 6))
 
+    # 4. Jadual Analisis Suria
     if not df.empty:
         cols = list(df.columns)
         rows = [
@@ -404,6 +395,16 @@ def create_pdf(lat, lon, bearing, df, start_date, place_name, file_path):
             pass
 
 
+def upload_pdf(pdf_path):
+    url = "https://tmpfiles.org/api/v1/upload"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with open(pdf_path, "rb") as f:
+        res = requests.post(url, files={"file": f}, headers=headers, timeout=20)
+    res.raise_for_status()
+    raw_url = res.json()["data"]["url"]
+    return raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+
 def generate_qr(target_url):
     qr = qrcode.QRCode(
         version=1,
@@ -416,8 +417,43 @@ def generate_qr(target_url):
     return qr.make_image(fill_color="#1A202C", back_color="white").convert("RGB")
 
 
+def build_qr_popup_html(qr_img, direct_pdf_url, lokasi_str, bearing_deg):
+    """Membina tetingkap Pop-up Modal HTML dengan Kod QR sebaik sahaja kiraan selesai."""
+    buffered = io.BytesIO()
+    qr_img.save(buffered, format="PNG")
+    qr_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    modal_id = f"qr_modal_{int(time.time() * 1000)}"
+
+    return f"""
+<input type="checkbox" id="{modal_id}" class="qr-modal-toggle" />
+<div class="qr-modal-overlay">
+  <div class="qr-modal-card">
+    <div class="qr-modal-badge">✅ LAPORAN SIAP DIJANA</div>
+    <h3 class="qr-modal-title">
+      Sila scan di sini untuk tentukan kiblat di lokasi anda dengan bayang matahari
+    </h3>
+    <div class="qr-modal-img-box">
+      <img src="data:image/png;base64,{qr_b64}" alt="Kod QR Laporan Kiblat" />
+    </div>
+    <p class="qr-modal-meta">
+      <strong>Lokasi:</strong> {lokasi_str}<br>
+      <strong>Arah Kiblat:</strong> {bearing_deg:.2f}° ({to_dms(bearing_deg)})
+    </p>
+    <div class="qr-modal-btn-group">
+      <a href="{direct_pdf_url}" target="_blank" rel="noopener noreferrer" class="qr-modal-dl">
+        📄 Muat Turun PDF Terus
+      </a>
+      <label for="{modal_id}" class="qr-modal-close">
+        ✖ Tutup Pop-up
+      </label>
+    </div>
+  </div>
+</div>
+"""
+
+
 # ----------------------------------------------------------------------
-# 4. Aliran Pemprosesan Utama (Hos Sendiri di Render)
+# 4. Aliran Pemprosesan Utama
 # ----------------------------------------------------------------------
 def process_data(lat, lon, start_date_str, tz, place_name=""):
     if lat is None or lon is None:
@@ -428,11 +464,10 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             pd.DataFrame({"Status": ["Sila isi koordinat"]}),
             Image.new("RGB", (200, 200), color=(240, 240, 240)),
             "",
+            "",
         )
 
     try:
-        cleanup_old_pdfs(max_age_seconds=3600)
-
         bearing = qibla_bearing(lat, lon)
         map_html = make_folium_map(lat, lon, bearing)
 
@@ -517,43 +552,38 @@ def process_data(lat, lon, start_date_str, tz, place_name=""):
             ]
             df = df[urutan]
 
-        # 2. Bina Dokumen PDF & Simpan Terus di Pelayan Render
-        time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"Laporan_Kiblat_{time_tag}.pdf"
-        pdf_path = os.path.join(PDF_STORAGE_DIR, pdf_filename)
-        latest_pdf_path = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
-
+        # 2. Bina Dokumen PDF
+        pdf_path = os.path.join(
+            tempfile.gettempdir(), f"Laporan_Kiblat_{dt.strftime('%Y%m%d')}.pdf"
+        )
         create_pdf(lat, lon, bearing, df, start_date_str, place_name, pdf_path)
-        shutil.copyfile(pdf_path, latest_pdf_path)
 
-        # 3. Jana Pautan Render Tanpa Iklan untuk QR Code
-        base_url = (os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:7860").rstrip("/")
-        direct_pdf_url = f"{base_url}/download-pdf?file={pdf_filename}"
+        # 3. Muat Naik & QR
+        direct_pdf_url = upload_pdf(pdf_path)
         qr_img = generate_qr(direct_pdf_url)
 
-        lokasi_info = place_name.strip() if place_name and place_name.strip() else f"`{lat:.6f}, {lon:.6f}`"
+        lokasi_clean = place_name.strip() if place_name and place_name.strip() else f"{lat:.6f}, {lon:.6f}"
         info = f"""
 ### Keputusan Kiblat
-* **Lokasi / Premis:** {lokasi_info}
+* **Lokasi / Premis:** {lokasi_clean}
 * **Koordinat:** `{lat:.6f}, {lon:.6f}`
 * **Arah Kiblat:** **{bearing:.4f}°** ({to_dms(bearing)}) dari Utara Sebenar
 * **Bayang Matahari:** 5 Hari bermula `{start_date_str}`
-* **Status:** Dokumen rasmi sedia dimuat turun terus (Tanpa Iklan).
+* **Status:** PDF sedia untuk diimbas.
 """
-        qr_status = f"""
-**Pautan Muat Turun Terus (Pelayan Render):**
-[📄 Klik Sini Untuk Muat Turun Fail PDF]({direct_pdf_url})
+        qr_status = f"**Pautan Muat Turun:**\n[{direct_pdf_url}]({direct_pdf_url})"
 
-*(Disimpan secara selamat di pelayan selama 60 minit)*
-"""
-        return map_html, info, df, qr_img, qr_status
+        # 4. Bina Pop-up Kod QR
+        popup_html = build_qr_popup_html(qr_img, direct_pdf_url, lokasi_clean, bearing)
+
+        return map_html, info, df, qr_img, qr_status, popup_html
 
     except Exception as e:
         traceback.print_exc()
         err_msg = f"❌ **Ralat:** `{type(e).__name__}: {str(e)}`"
         empty_df = pd.DataFrame({"Ralat": [str(e)]})
         dummy_img = Image.new("RGB", (200, 200), color=(240, 240, 240))
-        return "<p style='color:red;'>Ralat pemprosesan.</p>", err_msg, empty_df, dummy_img, err_msg
+        return "<p style='color:red;'>Ralat pemprosesan.</p>", err_msg, empty_df, dummy_img, err_msg, ""
 
 
 # ----------------------------------------------------------------------
@@ -650,6 +680,7 @@ CSS = """
     border: 1px solid rgba(255, 255, 255, 0.3) !important;
 }
 
+/* Sepanduk Sambungan & Lencana Pemasa */
 .connection-banner {
     display: flex;
     align-items: center;
@@ -838,6 +869,189 @@ CSS = """
     color: #E2E8F0 !important;
     background-color: #1E293B !important;
 }
+
+/* Butang Khas 'Cari Lokasi' (Menonjol & Interaktif) */
+.btn-search-special {
+    background: linear-gradient(135deg, #D97706 0%, #B45309 100%) !important;
+    color: #FFFFFF !important;
+    font-weight: 800 !important;
+    font-size: 1.02rem !important;
+    letter-spacing: 0.02em !important;
+    border: 2px solid #FDE68A !important;
+    border-radius: 10px !important;
+    padding: 10px 16px !important;
+    box-shadow: 0 4px 14px rgba(217, 119, 6, 0.4) !important;
+    cursor: pointer !important;
+    transition: all 0.25s ease-in-out !important;
+    animation: pulse-search 2.2s infinite !important;
+}
+
+.btn-search-special:hover {
+    transform: translateY(-2px) scale(1.02) !important;
+    box-shadow: 0 6px 18px rgba(217, 119, 6, 0.6) !important;
+    background: linear-gradient(135deg, #B45309 0%, #92400E 100%) !important;
+}
+
+@keyframes pulse-search {
+    0% {
+        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.7);
+    }
+    70% {
+        box-shadow: 0 0 0 10px rgba(245, 158, 11, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(245, 158, 11, 0);
+    }
+}
+
+/* ============================================================== */
+/* GAYA TETINGKAP POP-UP KOD QR (MODAL OVERLAY)                   */
+/* ============================================================== */
+.qr-modal-toggle {
+    display: none !important;
+}
+
+.qr-modal-toggle:checked + .qr-modal-overlay {
+    display: none !important;
+}
+
+.qr-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.78);
+    backdrop-filter: blur(5px);
+    z-index: 99999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    animation: qrPopupFadeIn 0.3s ease-out;
+}
+
+.qr-modal-card {
+    background: #FFFFFF;
+    border: 3px solid #D4AF37;
+    border-radius: 20px;
+    max-width: 440px;
+    width: 100%;
+    padding: 26px 24px;
+    text-align: center;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+    animation: qrPopupScaleUp 0.3s ease-out;
+}
+
+.dark .qr-modal-card {
+    background: #1E293B;
+    border-color: #D4AF37;
+    color: #F8FAFC;
+}
+
+.qr-modal-badge {
+    display: inline-block;
+    background: #DCFCE7;
+    color: #166534;
+    font-weight: 800;
+    font-size: 0.78rem;
+    padding: 5px 14px;
+    border-radius: 20px;
+    letter-spacing: 0.05em;
+    margin-bottom: 12px;
+}
+
+.qr-modal-title {
+    color: #2D5A60 !important;
+    font-size: 1.18rem !important;
+    font-weight: 800 !important;
+    line-height: 1.4 !important;
+    margin: 0 0 16px 0 !important;
+    border: none !important;
+    padding: 0 !important;
+}
+
+.dark .qr-modal-title {
+    color: #5EEAD4 !important;
+}
+
+.qr-modal-img-box {
+    background: #FFFFFF;
+    padding: 12px;
+    border-radius: 14px;
+    border: 2px dashed #CBD5E1;
+    display: inline-block;
+    margin-bottom: 14px;
+}
+
+.qr-modal-img-box img {
+    width: 210px;
+    height: 210px;
+    display: block;
+}
+
+.qr-modal-meta {
+    font-size: 0.88rem;
+    color: #475569;
+    line-height: 1.5;
+    margin: 0 0 18px 0;
+}
+
+.dark .qr-modal-meta {
+    color: #CBD5E1;
+}
+
+.qr-modal-btn-group {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.qr-modal-dl {
+    background: linear-gradient(135deg, #2D5A60 0%, #23464B 100%);
+    color: #FFFFFF !important;
+    text-decoration: none !important;
+    font-weight: 700;
+    font-size: 0.95rem;
+    padding: 11px 18px;
+    border-radius: 10px;
+    display: block;
+    transition: opacity 0.2s;
+}
+
+.qr-modal-dl:hover {
+    opacity: 0.92;
+}
+
+.qr-modal-close {
+    background: #F1F5F9;
+    color: #334155 !important;
+    font-weight: 700;
+    font-size: 0.92rem;
+    padding: 10px 18px;
+    border-radius: 10px;
+    border: 1px solid #CBD5E1;
+    cursor: pointer;
+    display: block;
+    transition: background 0.2s;
+}
+
+.dark .qr-modal-close {
+    background: #334155;
+    color: #F8FAFC !important;
+    border-color: #475569;
+}
+
+.qr-modal-close:hover {
+    background: #E2E8F0;
+}
+
+@keyframes qrPopupFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes qrPopupScaleUp {
+    from { transform: scale(0.9); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+}
 """
 
 
@@ -859,6 +1073,7 @@ def generate_header_html():
   <div class="bcns-nav">Kiblat &amp; Analisis Suria</div>
 </div>
 
+<!-- Sepanduk Makluman Sambungan Pangkalan Data & Jam Pemasa 30 Saat -->
 <div id="connection-banner-box" class="connection-banner">
   <div class="connection-banner-text">
     <span style="font-size: 1.3rem;">📡</span>
@@ -868,22 +1083,23 @@ def generate_header_html():
 </div>
 
 <div class="hero">
-  <h1>Penjana Bayang Matahari Selari Kiblat<br> </h1>
-  <p>Apps ini bertujuan untuk anda menentukan arah kiblat di lokasi anda, dan menentukan arah kiblat 
-  melalui bayang matahari.</p>
+  <h1>Penjana Bayang Matahari Selari Kiblat</h1>
+  <p>Aplikasi ini bertujuan untuk membantu anda menentukan arah kiblat di lokasi anda, serta menentukan arah kiblat melalui kaedah penjajaran bayang matahari.</p>
 </div>
 """
 
 
+# JavaScript rasmi Gradio untuk mengira detik (Countdown) 30 saat secara langsung
 COUNTDOWN_JS = """
 () => {
     let seconds = 30;
     const timerBadge = document.getElementById("connection-timer");
     const banner = document.getElementById("connection-banner-box");
-    
+
     if (!timerBadge) return;
+
     timerBadge.innerText = "⏳ 30s";
-    
+
     const interval = setInterval(() => {
         seconds--;
         if (seconds > 0) {
@@ -911,15 +1127,19 @@ COUNTDOWN_JS = """
 with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembilan") as demo:
     gr.HTML(generate_header_html())
 
+    # Komponen Pop-up Modal QR Code (muncul automatik apabila siap dijana)
+    popup_out = gr.HTML()
+
+    # Panduan Penggunaan Bernombor (Langkah Demi Langkah)
     with gr.Column(elem_classes="guide-box"):
         gr.Markdown(
             """
 ### 📋 Panduan Penggunaan (5 Langkah Mudah)
-1. **Cari Lokasi:** Masukkan nama tempat, masjid, atau alamat premis anda pada ruangan carian, kemudian klik butang **🔍 Cari Lokasi**.
+1. **Cari Lokasi:** Masukkan nama tempat, masjid, atau alamat premis anda pada ruangan carian, kemudian klik butang **👉 KLIK SINI DAHULU: CARI LOKASI 🔍**.
 2. **Sahkan Parameter:** Koordinat latitud, longitud, dan tarikh mula akan terisi secara automatik (anda boleh menukar tarikh jika perlu).
-3. **Jana Laporan:** Klik butang **Jana Laporan (5 Hari) & QR** untuk memulakan pengiraan algoritma falak.
-4. **Semak Unjuran:** Periksa garisan arah kiblat geodesi (2.0 km) pada peta interaktif dan rujuk jadual waktu penjajaran bayang suria harian (Pagi/Tengah Hari/Petang).
-5. **Dapatkan PDF & QR:** Imbas **Kod QR** menggunakan kamera telefon pintar anda atau klik pautan yang disediakan untuk memuat turun salinan dokumen rasmi PDF.
+3. **Jana Laporan:** Klik butang **Jana Pengiraan & QR** untuk memulakan pengiraan bayang matahari selari dengan arahb Kiablat.
+4. **Imbas Pop-up Kod QR:** Tetingkap **Kod QR** akan terpapar secara automatik di skrin—imbas menggunakan telefon pintar anda untuk memuat turun PDF.
+5. **Semak Unjuran & Jadual:** Tutup *pop-up* jika anda ingin memeriksa garisan kiblat (2.0 km) pada peta interaktif dan jadual waktu bayang matahari di bawah.
 """
         )
 
@@ -930,15 +1150,22 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
                 label="Cari Nama Tempat / Alamat Rumah",
                 placeholder="Contoh: Masjid Putra Putrajaya / Telok Kemang",
             )
-            btn_search = gr.Button("🔍 Cari Lokasi", variant="secondary")
+
+            btn_search = gr.Button(
+                "👉 KLIK SINI DAHULU: CARI LOKASI 🔍",
+                variant="primary",
+                elem_classes=["btn-search-special"],
+            )
             search_status = gr.Markdown()
 
             gr.Markdown("### 2. Parameter Analisis")
             lat_in = gr.Number(label="Latitud", value=3.139000, precision=6)
             lon_in = gr.Number(label="Longitud", value=101.686900, precision=6)
+
+            # Dinamik mengikut tarikh semasa Malaysia (UTC+8)
             date_in = gr.Textbox(
                 label="Tarikh Mula (YYYY-MM-DD)",
-                value=date.today().strftime("%Y-%m-%d"),
+                value=get_malaysia_today_str,
             )
             tz_in = gr.Number(label="Zon Masa (UTC)", value=8, precision=1)
             btn_run = gr.Button("Jana Laporan (5 Hari) & QR", variant="primary")
@@ -963,34 +1190,11 @@ with gr.Blocks(title="Kiblat & Bayang Matahari 5 Hari - Balai Cerap Negeri Sembi
     btn_run.click(
         process_data,
         inputs=[lat_in, lon_in, date_in, tz_in, search_input],
-        outputs=[map_out, info_out, table_out, qr_out, qr_text],
+        outputs=[map_out, info_out, table_out, qr_out, qr_text, popup_out],
     )
 
+    # Menjalankan skrip kiraan detik 30s sebaik sahaja aplikasi dimuatkan
     demo.load(fn=None, js=COUNTDOWN_JS)
-
-
-# ----------------------------------------------------------------------
-# 7. Pelayan FastAPI untuk Menyajikan Fail PDF Terus dari Render
-# ----------------------------------------------------------------------
-server = FastAPI()
-
-
-@server.get("/download-pdf")
-def direct_download_pdf(file: str = "laporan_terkini.pdf"):
-    """Endpoint selamat untuk muat turun terus fail PDF dari Render tanpa iklan."""
-    cleanup_old_pdfs(max_age_seconds=3600)
-    safe_name = os.path.basename(file)
-    target = os.path.join(PDF_STORAGE_DIR, safe_name)
-    if not os.path.exists(target):
-        target = os.path.join(PDF_STORAGE_DIR, "laporan_terkini.pdf")
-
-    if os.path.exists(target):
-        return FileResponse(
-            target,
-            media_type="application/pdf",
-            filename="Laporan_Kiblat_BCNS.pdf",
-        )
-    return {"status": "error", "message": "Fail PDF tidak dijumpai atau telah tamat tempoh (melebihi 60 minit)."}
 
 
 # Gabungkan aplikasi Gradio ke dalam pelayan FastAPI
